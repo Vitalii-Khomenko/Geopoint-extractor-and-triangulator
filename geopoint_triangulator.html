@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Geopoint Triangulator</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Segoe UI,Arial,Helvetica,sans-serif;margin:12px;color:#111}
+    .row{margin:10px 0;display:flex;flex-direction:column;gap:8px}
+    textarea{width:100%;height:34vh;min-height:120px;font-family:monospace;padding:8px;border-radius:8px}
+    label{display:block;margin-bottom:4px;font-weight:600}
+    table{border-collapse:collapse;width:100%;font-size:14px}
+    th,td{border:1px solid #ddd;padding:6px;text-align:left}
+    button{margin-right:8px;padding:12px 14px;border-radius:8px;border:0;background:#007acc;color:#fff;font-size:16px}
+    .small{font-size:0.9em;color:#444}
+    .controls{display:flex;flex-wrap:wrap;gap:8px}
+    @media(max-width:420px){ button{width:100%} .controls{flex-direction:column} }
+  </style>
+</head>
+<body>
+  <h2>Geopoint solver (angles+distances → coordinates)</h2>
+  <p class="small">Load File1 (measurements with angle & distance) and File2 (known coordinates). Select at least 3 reference points (IDs present in both files). The tool will compute instrument position and orientation and then compute coordinates for all measured points.</p>
+
+  <div class="row">
+  <label>File1 (measurements)</label>
+  <input id="file1" type="file" accept=".txt,.lqp,text/plain">
+  </div>
+  <div class="row">
+  <label>File2 (known coordinates)</label>
+  <input id="file2" type="file" accept=".txt,.csv,text/plain">
+  </div>
+  <div class="row">
+    <label>Angle units</label>
+    <select id="angleUnits"><option value="400">grads (400)</option><option value="360">degrees (360)</option></select>
+    <label style="margin-left:12px">Vertical angle type</label>
+    <select id="vertType"><option value="zenith">zenith (0 = up, 100 gon= horizon)</option><option value="inclination">inclination (0 = horizontal)</option></select>
+  </div>
+  <div class="row"></div>
+
+  <div class="row controls">
+    <button id="loadBtn">Load files and parse</button>
+    <button id="solveBtn" disabled>Solve and compute</button>
+    <button id="diagBtn" disabled>Diagnostics</button>
+    <button id="downloadBtn" disabled>Download computed coordinates (txt)</button>
+    <button id="clearBtn" type="button">Clear</button>
+    <button id="autoDetectBtn" disabled>Auto-detect orientation</button>
+  </div>
+
+  <h3>Matched points (select reference points)</h3>
+  <div id="matchesArea" class="row">No files loaded.</div>
+
+  <h3>Preview / Log</h3>
+  <textarea id="log" readonly>Logs will appear here</textarea>
+
+<script>
+(function(){
+  // runtime limits and helpers
+  const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+  function downloadBlob(blob, filename){ try{ const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.style.display='none'; a.href=url; a.download=filename; document.body.appendChild(a); a.click(); setTimeout(()=>{ try{ URL.revokeObjectURL(url);}catch(e){}; a.remove(); },150); }catch(e){ console.error('download failed', e); alert('Download failed: '+(e && e.message ? e.message : e)); } }
+  const file1In = document.getElementById('file1');
+  const file2In = document.getElementById('file2');
+  const loadBtn = document.getElementById('loadBtn');
+  const solveBtn = document.getElementById('solveBtn');
+  const matchesArea = document.getElementById('matchesArea');
+  const log = document.getElementById('log');
+  const downloadBtn = document.getElementById('downloadBtn');
+
+  let measurements = {}; // id -> {angleDeg, dist}
+  let known = {}; // id -> {E,N,H}
+  let instrumentStation = null; // {E,N,H} if present in File1
+  let solvedCoords = {}; // id -> {E,N}
+  let solution = null; // {X0,Y0,theta}
+
+  function appendLog(s){ log.value = s + '\n\n' + log.value; }
+
+  function parseFile1(text){
+    try{
+      const lines = String(text).split(/\r?\n/);
+      const re = /^\s*(\S+)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)(?:\s+([0-9]+(?:\.[0-9]+)?))?.*$/;
+      const out = {};
+      for(const ln of lines){
+        const m = ln.match(re);
+        if(!m) continue;
+        const id = m[1];
+        const hz = Number(m[2]);
+        const v = Number(m[3]);
+        const dist = Number(m[4]);
+        const prismH = (m[5] !== undefined) ? Number(m[5]) : undefined;
+        if(!Number.isFinite(hz) || !Number.isFinite(v) || !Number.isFinite(dist)) continue;
+        out[id] = {hz:hz, v:v, dist:dist, prismHeight: Number.isFinite(prismH)? prismH : undefined};
+      }
+      return out;
+    }catch(e){ throw new Error('parseFile1 failed: '+(e && e.message ? e.message : e)); }
+  }
+
+  // try to parse instrument station coordinates from file1 (.lqp) if present
+  function parseStationFromFile1(text){
+    // locate 'Standpunkt' or 'Standpkt' header then parse the following coordinate line
+    const lines = text.split(/\r?\n/);
+    let start = -1;
+    for(let i=0;i<lines.length;i++){
+      if(/Standpunkt/i.test(lines[i]) || /Standpkt/i.test(lines[i]) || /Standpkt-Nr/i.test(lines[i]) ) { start = i; break; }
+    }
+  const coordRe = /^\s*(\d{1,5})\s+(\d{6,}\.\d+)\s+(\d{7,}\.\d+)\s+(-?[0-9]+\.?[0-9]*).*/;
+    if(start >= 0){
+      for(let i=start+1;i<Math.min(lines.length, start+30); i++){
+        const m = lines[i].match(coordRe);
+        if(m){ const id=m[1]; const E=Number(m[2]); const N=Number(m[3]); const H=Number(m[4]); if(Number.isFinite(E) && Number.isFinite(N)) return {id:id, E:E, N:N, H:H}; }
+      }
+    }
+    // fallback: search entire file for a line with East(6+) and North(7+) numbers
+    for(let i=0;i<lines.length;i++){
+      const m = lines[i].match(coordRe);
+      if(m){ const id=m[1]; const E=Number(m[2]); const N=Number(m[3]); const H=Number(m[4]); if(Number.isFinite(E) && Number.isFinite(N)) return {id:id, E:E, N:N, H:H}; }
+    }
+    return null;
+  }
+
+  function parseFile2(text){
+    try{
+      const lines = String(text).split(/\r?\n/);
+      const re = /^\s*(\S+)\s+(\d{6,}\.\d+)\s+(\d{7,}\.\d+)\s+(-?[0-9]+\.?[0-9]*).*$/;
+      const out = {};
+      for(const ln of lines){
+        const m = ln.match(re);
+        if(!m) continue;
+        const id = m[1]; const E = Number(m[2]); const N = Number(m[3]); const H = Number(m[4]);
+        if(!Number.isFinite(E) || !Number.isFinite(N)) continue;
+        out[id] = {E:E, N:N, H: Number.isFinite(H)? H : 0};
+      }
+      return out;
+    }catch(e){ throw new Error('parseFile2 failed: '+(e && e.message ? e.message : e)); }
+  }
+
+  // numeric solver: Gauss-Newton for params p=[X0,Y0,Z0,theta]
+  function solveGN(refs, angleUnits, vertType){
+    return solveGNVariant(refs, angleUnits, vertType, {flipHz:false, swapXY:false});
+  }
+
+  // variant solver with options: flipHz (multiply hz by -1), swapXY (use cos for X and sin for Y)
+  function solveGNVariant(refs, angleUnits, vertType, opts){
+    // refs: array of {id, hz, v, dist, E, N, H}
+    if(refs.length < 3) return {err:'Need at least 3 reference points'};
+    const unit = angleUnits === '400' ? Math.PI/200 : Math.PI/180; // convert units to radians
+    // initial guess: X0,Y0 = average of (E - h*sin(a)), (N - h*cos(a)) with theta possibly set from opts, Z0 average of H - vertical delta
+    // opts.thetaOffset (number) may be provided in the same angular units as angleUnits (e.g. 0,100,200,300 for grads)
+    const initialTheta = (opts && typeof opts.thetaOffset === 'number') ? (opts.thetaOffset * unit) : 0;
+    let theta = initialTheta;
+    let X0 = 0, Y0 = 0, Z0 = 0;
+    for(const r of refs){
+      const hz = opts && opts.flipHz ? -r.hz : r.hz;
+      const a = theta + hz * unit;
+      // compute inclination alpha from vertical type
+      let alpha;
+      if(vertType === 'zenith'){
+        // V is in same units; horizon = 100 gon (400 scale) or 90 deg -> inclination = (100 - V) in gon
+        alpha = ( (angleUnits==='400' ? 100 : 90) - r.v ) * unit;
+      } else {
+        alpha = r.v * unit; // direct inclination above horizontal
+      }
+      const h = r.dist * Math.cos(alpha);
+      const delta = r.dist * Math.sin(alpha);
+      // if prismHeight provided, measured H is prism center; instrument Z0 + delta should equal (r.H - prismHeight)
+  const measH = (r.prismHeight !== undefined && r.prismHeight !== null) ? (r.H + r.prismHeight) : r.H;
+      if(opts.swapXY){ X0 += (r.E - h * Math.cos(a)); Y0 += (r.N - h * Math.sin(a)); }
+      else { X0 += (r.E - h * Math.sin(a)); Y0 += (r.N - h * Math.cos(a)); }
+      Z0 += (measH - delta);
+    }
+    X0 /= refs.length; Y0 /= refs.length; Z0 /= refs.length;
+
+    for(let iter=0; iter<100; iter++){
+      const residuals = [];
+      const J = []; // rows of jacobian (3N x 4)
+      for(const r of refs){
+  const hz = opts && opts.flipHz ? -r.hz : r.hz;
+        const a = theta + hz * unit;
+        let alpha;
+        if(vertType === 'zenith') alpha = ( (angleUnits==='400' ? 100 : 90) - r.v ) * unit;
+        else alpha = r.v * unit;
+  const h = r.dist * Math.cos(alpha);
+  const delta = r.dist * Math.sin(alpha);
+  const px = opts.swapXY ? X0 + h * Math.cos(a) : X0 + h * Math.sin(a);
+  const py = opts.swapXY ? Y0 + h * Math.sin(a) : Y0 + h * Math.cos(a);
+  // instrument height + delta should match measured prism center height minus prismHeight
+  const measH = (r.prismHeight !== undefined && r.prismHeight !== null) ? (r.H + r.prismHeight) : r.H;
+  const pz = Z0 + delta;
+  residuals.push(px - r.E);
+  residuals.push(py - r.N);
+  residuals.push(pz - measH);
+        // Jacobian rows for [X0,Y0,Z0,theta]
+        // d(px)/dX0 = 1; d(px)/dY0=0; d(px)/dZ0=0; d(px)/dtheta = h * cos(a)
+        if(opts.swapXY){
+          J.push([1,0,0, -h * Math.sin(a)]);
+          J.push([0,1,0, h * Math.cos(a)]);
+        } else {
+          J.push([1,0,0, h * Math.cos(a)]);
+          J.push([0,1,0, -h * Math.sin(a)]);
+        }
+  // d(pz)/dX0=0; d(pz)/dY0=0; d(pz)/dZ0=1; d(pz)/dtheta = 0
+        J.push([0,0,1, 0]);
+      }
+      // compute JTJ and JTr for 4x4
+      const npar = 4;
+      const JTJ = Array.from({length:npar}, ()=>Array(npar).fill(0));
+      const JTr = Array(npar).fill(0);
+      for(let i=0;i<J.length;i++){
+        const Ji = J[i];
+        for(let p=0;p<npar;p++){
+          JTr[p] += Ji[p] * residuals[i];
+          for(let q=0;q<npar;q++) JTJ[p][q] += Ji[p] * Ji[q];
+        }
+      }
+      // solve JTJ * delta = -JTr
+      const delta = solveLinearSystem(JTJ, JTr.map(x=>-x));
+      if(!delta) return {err:'Singular normal matrix (bad geometry)'};
+      X0 += delta[0]; Y0 += delta[1]; Z0 += delta[2]; theta += delta[3];
+      if(Math.hypot(delta[0],delta[1],delta[2],delta[3]) < 1e-9) break;
+    }
+    return {X0, Y0, Z0, theta};
+  }
+
+  // auto-detect orientation by testing combinations of flipHz and swapXY and reporting best RMS
+  const autoDetectBtn = document.getElementById('autoDetectBtn');
+  autoDetectBtn.addEventListener('click', ()=>{
+    const checks = matchesArea.querySelectorAll('input[type=checkbox]:checked');
+  const refs = [];
+  for(const c of checks){ const id=c.value; if(!measurements[id]||!known[id]) continue; const m=measurements[id]; refs.push({id:id,hz:m.hz,v:m.v,dist:m.dist,prismHeight:m.prismHeight,E:known[id].E,N:known[id].N,H:known[id].H}); }
+    if(refs.length<3){ alert('Select at least 3 reference points with known coords'); return; }
+    appendLog('Running auto-detect on refs: '+refs.map(r=>r.id).join(', '));
+    const variants = [];
+    for(const flip of [false,true]) for(const swap of [false,true]) variants.push({flipHz:flip, swapXY:swap});
+    // theta offsets to try: quarter-turns (in units of the angleUnits)
+    const angleUnits = document.getElementById('angleUnits').value;
+    const thetaOffsets = angleUnits==='400' ? [0,100,200,300] : [0,90,180,270];
+    let best=null;
+  for(const v of variants){
+      for(const off of thetaOffsets){
+        // solve with this variant and initial theta offset
+        const opts = Object.assign({}, v, {thetaOffset: off});
+        const sol = solveGNVariant(refs, angleUnits, document.getElementById('vertType').value, opts);
+        if(sol.err) { appendLog('Variant '+JSON.stringify(v)+' offset '+off+' error: '+sol.err); continue; }
+        // compute RMS for refs, applying offset to theta. use prismHeight when present
+        let sum2=0,n=0; const unit = angleUnits==='400'?Math.PI/200:Math.PI/180;
+        const offRad = off * unit;
+        for(const r of refs){
+          const hz = opts.flipHz? -r.hz: r.hz;
+          const a = sol.theta + offRad + hz*unit;
+          const alpha = (document.getElementById('vertType').value==='zenith')?(((angleUnits==='400')?100:90)-r.v)*unit: r.v*unit;
+          const h=r.dist*Math.cos(alpha);
+          const delta=r.dist*Math.sin(alpha);
+          const px = opts.swapXY? sol.X0 + h*Math.cos(a) : sol.X0 + h*Math.sin(a);
+          const py = opts.swapXY? sol.Y0 + h*Math.sin(a) : sol.Y0 + h*Math.cos(a);
+          const measH = (r.prismHeight !== undefined && r.prismHeight !== null) ? (r.H + r.prismHeight) : r.H;
+          const pz = sol.Z0 + delta;
+          const rx=px-r.E, ry=py-r.N, rz=pz-measH;
+          sum2 += rx*rx+ry*ry+rz*rz; n+=3;
+        }
+        const rms = Math.sqrt(sum2/n);
+        appendLog('Variant '+JSON.stringify(v)+' offset '+off+' RMS='+ (rms*1000).toFixed(3)+' mm');
+        if(!best || rms<best.rms) best={rms: rms, sol: sol, variant:v, offset: off};
+      }
+    }
+    if(best){ appendLog('Best variant: '+JSON.stringify(best.variant)+' offset '+best.offset+' RMS='+ (best.rms*1000).toFixed(3)+' mm'); appendLog('Solution: X0='+best.sol.X0.toFixed(3)+', Y0='+best.sol.Y0.toFixed(3)+', Z0='+best.sol.Z0.toFixed(3)+', theta='+((angleUnits==='400')?best.sol.theta*200/Math.PI:best.sol.theta*180/Math.PI).toFixed(6));
+      solution = best.sol;
+      // store chosen offset so solution application uses it
+      solution._thetaOffset = best.offset;
+    }
+
+    // --- RANSAC inlier selection and fine theta refinement (optional automated steps)
+    // run RANSAC on the best variant to remove outlier refs, then run a fine theta grid search
+    if(best){
+      appendLog('Running RANSAC inlier selection on best variant...');
+      const ransacResult = ransacRefs(refs, angleUnits, document.getElementById('vertType').value, best.variant, best.offset);
+      if(ransacResult && ransacResult.inliers && ransacResult.inliers.length < refs.length){
+        appendLog('RANSAC removed '+(refs.length - ransacResult.inliers.length)+' outliers — inliers='+ransacResult.inliers.map(r=>r.id).join(', '));
+        appendLog('Re-solving on inliers...');
+        const sol2 = solveGNVariant(ransacResult.inliers, angleUnits, document.getElementById('vertType').value, Object.assign({}, best.variant, {thetaOffset: best.offset}));
+        if(!sol2.err){
+          const rms2 = computeRMS(ransacResult.inliers, sol2, best.variant, angleUnits, document.getElementById('vertType').value, best.offset);
+          appendLog('After RANSAC solution RMS='+ (rms2*1000).toFixed(3)+' mm');
+          solution = sol2; solution._thetaOffset = best.offset;
+        }
+      } else appendLog('RANSAC found no outliers or failed to improve.');
+
+      appendLog('Running fine theta grid search around offset '+best.offset+'...');
+      const refine = fineThetaRefine(refs, angleUnits, document.getElementById('vertType').value, best.variant, best.offset);
+      if(refine && refine.sol){
+        appendLog('Fine-refine best offset='+refine.offset+' RMS='+ (refine.rms*1000).toFixed(3)+' mm');
+        solution = refine.sol; solution._thetaOffset = refine.offset;
+      } else appendLog('Fine theta refine made no improvement.');
+    }
+    // if we have an instrument station parsed from file, test conventions using that fixed station (no solving)
+    if(instrumentStation){
+      appendLog('Testing conventions using parsed instrument station id='+instrumentStation.id+' E='+instrumentStation.E.toFixed(3)+',N='+instrumentStation.N.toFixed(3));
+      const unit = angleUnits==='400'?Math.PI/200:Math.PI/180;
+      for(const v of variants){
+        for(const off of thetaOffsets){
+          let sum2=0,n=0; const offRad = off * unit;
+          for(const r of refs){
+            const hz = v.flipHz? -r.hz: r.hz;
+            const a = offRad + hz*unit;
+            const alpha = (document.getElementById('vertType').value==='zenith')?(((angleUnits==='400')?100:90)-r.v)*unit: r.v*unit;
+            const h=r.dist*Math.cos(alpha);
+            const delta=r.dist*Math.sin(alpha);
+            const px = v.swapXY? instrumentStation.E + h*Math.cos(a) : instrumentStation.E + h*Math.sin(a);
+            const py = v.swapXY? instrumentStation.N + h*Math.sin(a) : instrumentStation.N + h*Math.cos(a);
+            const measH = (r.prismHeight !== undefined && r.prismHeight !== null) ? (r.H + r.prismHeight) : r.H;
+            const pz = instrumentStation.H + delta;
+            const rx=px-r.E, ry=py-r.N, rz=pz-measH;
+            sum2 += rx*rx+ry*ry+rz*rz; n+=3;
+          }
+          const rms = Math.sqrt(sum2/n);
+          appendLog('Station-variant '+JSON.stringify(v)+' offset '+off+' RMS='+ (rms*1000).toFixed(3)+' mm');
+        }
+      }
+    }
+  });
+
+  // generic linear solver using Gaussian elimination for small matrices
+  function solveLinearSystem(A, b){
+    const n = A.length;
+    // build augmented matrix
+    const M = A.map((row,i)=> row.concat([b[i]]));
+    for(let k=0;k<n;k++){
+      // find pivot
+      let i_max = k; let max = Math.abs(M[k][k]);
+      for(let i=k+1;i<n;i++){ if(Math.abs(M[i][k])>max){ max=Math.abs(M[i][k]); i_max=i; } }
+      if(max < 1e-15) return null;
+      // swap
+      if(i_max !== k){ const tmp = M[k]; M[k]=M[i_max]; M[i_max]=tmp; }
+      // normalize and eliminate
+      for(let i=k+1;i<n;i++){
+        const f = M[i][k]/M[k][k];
+        for(let j=k;j<=n;j++) M[i][j] -= f * M[k][j];
+      }
+    }
+    // back substitution
+    const x = Array(n).fill(0);
+    for(let i=n-1;i>=0;i--){
+      let s = M[i][n];
+      for(let j=i+1;j<n;j++) s -= M[i][j]*x[j];
+      x[i] = s / M[i][i];
+    }
+    return x;
+  }
+
+  // compute RMS for a given solution and variant (offset in angular units)
+  function computeRMS(refs, sol, variant, angleUnits, vertType, offset){
+    const unit = angleUnits==='400'?Math.PI/200:Math.PI/180;
+    const offRad = (offset||0) * unit;
+    let sum2=0, n=0;
+    for(const r of refs){
+      const hz = variant.flipHz? -r.hz: r.hz;
+      const a = sol.theta + offRad + hz*unit;
+      const alpha = (vertType==='zenith')?(((angleUnits==='400')?100:90)-r.v)*unit: r.v*unit;
+      const h=r.dist*Math.cos(alpha);
+      const delta=r.dist*Math.sin(alpha);
+      const px = variant.swapXY? sol.X0 + h*Math.cos(a) : sol.X0 + h*Math.sin(a);
+      const py = variant.swapXY? sol.Y0 + h*Math.sin(a) : sol.Y0 + h*Math.cos(a);
+      const measH = (r.prismHeight !== undefined && r.prismHeight !== null) ? (r.H + r.prismHeight) : r.H;
+      const pz = sol.Z0 + delta;
+      const rx=px-r.E, ry=py-r.N, rz=pz-measH;
+      sum2 += rx*rx+ry*ry+rz*rz; n+=3;
+    }
+    return Math.sqrt(sum2/n);
+  }
+
+  // simple RANSAC: try leaving-one-out repeatedly, pick set with smallest RMS
+  function ransacRefs(refs, angleUnits, vertType, variant, offset){
+    if(refs.length <= 3) return {inliers: refs};
+    let bestInliers = refs.slice(); let bestRms = computeRMS(refs, solveGNVariant(refs, angleUnits, vertType, Object.assign({}, variant, {thetaOffset: offset})), variant, angleUnits, vertType, offset);
+    // try removing each single ref to see if RMS improves
+    for(let i=0;i<refs.length;i++){
+      const trial = refs.slice(0,i).concat(refs.slice(i+1));
+      const sol = solveGNVariant(trial, angleUnits, vertType, Object.assign({}, variant, {thetaOffset: offset}));
+      if(sol.err) continue;
+      const rms = computeRMS(trial, sol, variant, angleUnits, vertType, offset);
+      if(rms < bestRms){ bestRms = rms; bestInliers = trial; }
+    }
+    return {inliers: bestInliers, rms: bestRms};
+  }
+
+  // fine theta grid search: search ±2 gon (or degrees) around base offset with step 0.1 gon/deg
+  function fineThetaRefine(refs, angleUnits, vertType, variant, baseOffset){
+    const unit = angleUnits==='400'?1:1; // keep offsets in same units
+    const step = angleUnits==='400' ? 0.1 : 0.1; // 0.1 gon or deg
+    const span = angleUnits==='400' ? 2 : 2; // ±2 gons or degrees
+    let best = null;
+    for(let d = -span; d <= span; d += step){
+      const off = baseOffset + d;
+      const sol = solveGNVariant(refs, angleUnits, vertType, Object.assign({}, variant, {thetaOffset: off}));
+      if(sol.err) continue;
+      const rms = computeRMS(refs, sol, variant, angleUnits, vertType, off);
+      if(!best || rms < best.rms){ best = {rms: rms, sol: sol, offset: off}; }
+    }
+    return best;
+  }
+
+  function determinant3(m){
+    return m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+  }
+  function invert3(m, det){
+    const inv = [[0,0,0],[0,0,0],[0,0,0]];
+    inv[0][0] =  (m[1][1]*m[2][2]-m[1][2]*m[2][1])/det;
+    inv[0][1] = -(m[0][1]*m[2][2]-m[0][2]*m[2][1])/det;
+    inv[0][2] =  (m[0][1]*m[1][2]-m[0][2]*m[1][1])/det;
+    inv[1][0] = -(m[1][0]*m[2][2]-m[1][2]*m[2][0])/det;
+    inv[1][1] =  (m[0][0]*m[2][2]-m[0][2]*m[2][0])/det;
+    inv[1][2] = -(m[0][0]*m[1][2]-m[0][2]*m[1][0])/det;
+    inv[2][0] =  (m[1][0]*m[2][1]-m[1][1]*m[2][0])/det;
+    inv[2][1] = -(m[0][0]*m[2][1]-m[0][1]*m[2][0])/det;
+    inv[2][2] =  (m[0][0]*m[1][1]-m[0][1]*m[1][0])/det;
+    return inv;
+  }
+
+  loadBtn.addEventListener('click', ()=>{
+    const f1 = file1In.files && file1In.files[0];
+    const f2 = file2In.files && file2In.files[0];
+    if(!f1 || !f2){ alert('Select both files'); return; }
+    if(f1.size > MAX_FILE_SIZE || f2.size > MAX_FILE_SIZE){ alert('One of the files is too large for mobile processing (>5 MB). Run on PC or reduce file size.'); return; }
+    const r1 = new FileReader();
+    const r2 = new FileReader();
+    r1.onload = function(){
+      try{
+        measurements = parseFile1(r1.result);
+        instrumentStation = parseStationFromFile1(r1.result);
+      }catch(e){ appendLog('Error parsing File1: '+(e && e.message?e.message:e)); return; }
+      r2.onload = function(){
+        try{
+          known = parseFile2(r2.result);
+        }catch(e){ appendLog('Error parsing File2: '+(e && e.message?e.message:e)); return; }
+        // build intersection list using safe DOM operations
+        const ids = Object.keys(measurements).sort();
+        matchesArea.innerHTML = '';
+        const table = document.createElement('table');
+        const thead = document.createElement('thead');
+        const htr = document.createElement('tr');
+        ['Use as ref','Point ID (meas)','Known in file2?','Known E','Known N'].forEach(t=>{ const th = document.createElement('th'); th.textContent = t; htr.appendChild(th); });
+        thead.appendChild(htr); table.appendChild(thead);
+        const tbody = document.createElement('tbody');
+        for(const id of ids){
+          const tr = document.createElement('tr');
+          const tdChk = document.createElement('td');
+          const ok = document.createElement('input'); ok.type='checkbox'; ok.value=id; tdChk.appendChild(ok);
+          const tdId = document.createElement('td'); tdId.textContent = id;
+          const kd = known[id] || null;
+          const tdKnown = document.createElement('td'); tdKnown.textContent = kd? 'yes':'no';
+          const tdE = document.createElement('td'); tdE.textContent = kd? String(kd.E): '';
+          const tdN = document.createElement('td'); tdN.textContent = kd? String(kd.N): '';
+          tr.appendChild(tdChk); tr.appendChild(tdId); tr.appendChild(tdKnown); tr.appendChild(tdE); tr.appendChild(tdN);
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody); matchesArea.appendChild(table);
+        appendLog('Parsed files: measurements ' + Object.keys(measurements).length + ', known coords ' + Object.keys(known).length);
+        solveBtn.disabled = false; diagBtn.disabled = false; document.getElementById('autoDetectBtn').disabled = false;
+      };
+      r2.readAsText(f2, 'utf-8');
+    };
+    r1.readAsText(f1, 'utf-8');
+  });
+
+  // Clear button
+  const clearBtn = document.getElementById('clearBtn');
+  clearBtn.addEventListener('click', ()=>{
+    file1In.value = ''; file2In.value = ''; matchesArea.innerHTML = 'No files loaded.'; log.value = 'Logs will appear here'; measurements={}; known={}; instrumentStation=null; solvedCoords={}; solution=null; downloadBtn.disabled = true; solveBtn.disabled = true; diagBtn.disabled = true; document.getElementById('autoDetectBtn').disabled = true;
+  });
+
+  // drag & drop (optional on mobile)
+  document.body.addEventListener('dragover', e=>{ e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  document.body.addEventListener('drop', e=>{ e.preventDefault(); if(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length>0){ const files = e.dataTransfer.files; // set file inputs if two files provided
+    if(files.length>=2){ try{ file1In.files = files; file2In.files = files; loadBtn.click(); }catch(err){ console.warn('drop assign failed', err); } } else if(files.length===1){ file1In.files = files; } } });
+
+  const diagBtn = document.getElementById('diagBtn');
+  diagBtn.addEventListener('click', ()=>{
+    const checks = matchesArea.querySelectorAll('input[type=checkbox]:checked');
+    if(checks.length===0){ alert('Select one or more reference points in the table first'); return; }
+    appendLog('Diagnostics for selected refs:');
+    const unit = document.getElementById('angleUnits').value==='400'?Math.PI/200:Math.PI/180;
+    for(const c of checks){ const id=c.value; const m = measurements[id]; const k = known[id];
+      if(!m){ appendLog('No measurement for '+id); continue; }
+      if(!k){ appendLog('No known coord for '+id); continue; }
+      // predicted from declared station (if available)
+  if(instrumentStation){ const a = m.hz * unit; let alpha = (document.getElementById('vertType').value==='zenith')?(((document.getElementById('angleUnits').value==='400')?100:90)-m.v)*unit: m.v*unit; const h = m.dist * Math.cos(alpha); const delta = m.dist * Math.sin(alpha); const Epred = instrumentStation.E + h * Math.sin(a); const Npred = instrumentStation.N + h * Math.cos(a); const Hpred = instrumentStation.H + delta; const measH = (m.prismHeight !== undefined && m.prismHeight !== null) ? (k.H + m.prismHeight) : k.H; appendLog('From station '+instrumentStation.id+' -> '+id+': Epred='+Epred.toFixed(3)+', Npred='+Npred.toFixed(3)+', Hpred='+Hpred.toFixed(3)+' ; known E,N,H(prism center)='+k.E.toFixed(3)+','+k.N.toFixed(3)+','+measH.toFixed(3)); }
+      // predicted from current solution (if exists)
+  if(solution){ const a2 = solution.theta + m.hz * unit; let alpha2 = (document.getElementById('vertType').value==='zenith')?(((document.getElementById('angleUnits').value==='400')?100:90)-m.v)*unit: m.v*unit; const h2 = m.dist * Math.cos(alpha2); const delta2 = m.dist * Math.sin(alpha2); const Esol = solution.X0 + h2 * Math.sin(a2); const Nsol = solution.Y0 + h2 * Math.cos(a2); const measH = (m.prismHeight !== undefined && m.prismHeight !== null) ? (k.H + m.prismHeight) : k.H; const Hsol = solution.Z0 + delta2; appendLog('From solution -> '+id+': E='+Esol.toFixed(3)+', N='+Nsol.toFixed(3)+', H(prism center)='+Hsol.toFixed(3)+' ; known(prism center)='+k.E.toFixed(3)+','+k.N.toFixed(3)+','+measH.toFixed(3)); }
+    }
+    if(!instrumentStation) appendLog('No instrument station parsed from File1. If your input is a Leica .lqp, ensure it contains Standpunkt(Koordinaten) block.');
+  });
+
+  solveBtn.addEventListener('click', ()=>{
+    // collect checked refs that also have known coords (must be in both)
+    const checks = matchesArea.querySelectorAll('input[type=checkbox]:checked');
+    const refs = [];
+    for(const c of checks){
+      const id = c.value;
+      const m = measurements[id];
+      const k = known[id];
+      if(!m) continue;
+      if(!k){ appendLog('Ref '+id+' has no known coord; skip'); continue; }
+      // measurements store hz, v, dist; known stores E,N,H
+  refs.push({id:id, hz: m.hz, v: m.v, dist: m.dist, prismHeight: m.prismHeight, E: k.E, N: k.N, H: k.H});
+    }
+    if(refs.length < 3){ alert('Select at least 3 reference points that have known coords in File2'); return; }
+    appendLog('Solving using refs: ' + refs.map(r=>r.id).join(', '));
+  const angleUnits = document.getElementById('angleUnits').value;
+  const vertType = document.getElementById('vertType').value;
+  const sol = solveGN(refs, angleUnits, vertType);
+    if(sol.err){ appendLog('Error: '+sol.err); return; }
+  solution = sol;
+  const thetaDeg = (angleUnits==='400') ? sol.theta * 200/Math.PI : sol.theta * 180/Math.PI;
+  appendLog('Solution: X0='+sol.X0.toFixed(3)+', Y0='+sol.Y0.toFixed(3)+', Z0='+sol.Z0.toFixed(3)+', theta='+thetaDeg.toFixed(6)+' ('+ (angleUnits==='400'?'gons':'deg') +')');
+  // log residuals on the reference points and compute RMS
+    try{
+    let sum2 = 0, nres = 0;
+    const unit = angleUnits==='400'?Math.PI/200:Math.PI/180;
+    const thetaOffsetApplied = (sol && sol._thetaOffset) ? sol._thetaOffset * unit : 0;
+    for(const r of refs){
+      const a = sol.theta + thetaOffsetApplied + r.hz * unit;
+      let alpha = (vertType==='zenith') ? (((angleUnits==='400')?100:90) - r.v) * unit : r.v * unit;
+      const h = r.dist * Math.cos(alpha);
+      const delta = r.dist * Math.sin(alpha);
+      const px = sol.X0 + h * Math.sin(a);
+      const py = sol.Y0 + h * Math.cos(a);
+  const measH = (r.prismHeight !== undefined && r.prismHeight !== null) ? (r.H + r.prismHeight) : r.H;
+  const pz = sol.Z0 + delta;
+  const rx = px - r.E; const ry = py - r.N; const rz = pz - measH;
+  appendLog('Ref '+r.id+' residuals (m): dE='+rx.toFixed(3)+', dN='+ry.toFixed(3)+', dH='+rz.toFixed(3));
+      sum2 += rx*rx + ry*ry + rz*rz; nres += 3;
+    }
+    if(nres>0){ const rms = Math.sqrt(sum2 / nres); appendLog('RMS residual (3D) = '+ (rms*1000).toFixed(3) + ' mm'); }
+  }catch(e){ appendLog('Residual calc error: '+e.message); }
+    // compute all points
+    solvedCoords = {};
+    for(const id in measurements){
+    // if this point has a known coord in file2, preserve it exactly
+    if(known[id]){ solvedCoords[id] = {E: known[id].E, N: known[id].N, H: known[id].H}; continue; }
+    const m = measurements[id]; const unit = angleUnits==='400'?Math.PI/200:Math.PI/180; const a = sol.theta + m.hz * unit;
+  let alpha; const thetaOffsetApplied2 = (sol && sol._thetaOffset) ? sol._thetaOffset * unit : 0; const a2 = sol.theta + thetaOffsetApplied2 + m.hz * unit;
+  if(vertType==='zenith') alpha = ((angleUnits==='400'?100:90) - m.v) * unit; else alpha = m.v * unit;
+    const h = m.dist * Math.cos(alpha); const delta = m.dist * Math.sin(alpha);
+  const E = sol.X0 + h * Math.sin(a2); const N = sol.Y0 + h * Math.cos(a2); const prismC = sol.Z0 + delta; const H = (m.prismHeight !== undefined && m.prismHeight !== null) ? (prismC - m.prismHeight) : prismC;
+    solvedCoords[id]={E,N,H};
+  }
+  appendLog('Computed coordinates for '+Object.keys(solvedCoords).length+' points.');
+    downloadBtn.disabled = false;
+  });
+
+  downloadBtn.addEventListener('click', ()=>{
+    if(!solution) return;
+    let out = 'Point-ID\tEast\tNorth\tHeight\n';
+    for(const id of Object.keys(solvedCoords)){
+      const p = solvedCoords[id];
+      out += id + '\t' + p.E.toFixed(3) + '\t' + p.N.toFixed(3) + '\t' + p.H.toFixed(3) + '\n';
+    }
+  const blob = new Blob([out], {type:'text/plain;charset=utf-8'});
+  downloadBlob(blob, 'computed_coords.txt');
+  });
+
+})();
+</script>
+</body>
+</html>

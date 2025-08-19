@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Geopoint extractor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- Note: this is a static client-side tool. No network calls are made. -->
+  <style>
+    body{font-family:Segoe UI,Arial,Helvetica,sans-serif;margin:12px;line-height:1.3;color:#111}
+    input[type=file]{width:100%;padding:12px 8px;border-radius:8px;background:#fff}
+    .row{margin:10px 0;display:flex;flex-direction:column;gap:8px}
+    button{margin-right:8px;padding:12px 14px;font-size:16px;border-radius:8px;border:0;background:#007acc;color:#fff}
+    a.btn{display:inline-block;padding:12px 14px;margin-right:8px;background:#007acc;color:#fff;border-radius:8px;text-decoration:none}
+    a.btn.disabled{opacity:0.5;pointer-events:none}
+    pre{background:#f6f6f6;padding:12px;border:1px solid #ddd;white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto}
+    .controls{display:flex;flex-wrap:wrap;gap:8px}
+    label.small{font-size:13px;color:#444}
+    @media (max-width:420px){
+      body{margin:8px}
+      button,a.btn{width:100%;font-size:18px}
+      .controls{flex-direction:column}
+    }
+  </style>
+</head>
+<body>
+  <h2>Geopoint extractor</h2>
+  <p>Select a protocol file (.lqp). The script will extract two .txt files: one with Hz/V/Distance, the other with East/North/Height.</p>
+
+  <div class="row">
+    <label class="small">Select a protocol file (.lqp) or drop it here</label>
+    <input id="fileIn" type="file" accept=".lqp,.txt,text/plain">
+    <div class="controls">
+      <button id="parseBtn">Parse and show</button>
+      <button id="clearBtn" type="button">Clear</button>
+    </div>
+  </div>
+
+  <h3>Compare exports</h3>
+  <div class="row">
+  <label class="small">Original .lqp (for compare)</label>
+  <input id="origIn" type="file" accept=".lqp,.txt,text/plain"> original .lqp
+  </div>
+  <div class="row">
+  <label class="small">Exported File2 (East/North/Height)</label>
+  <input id="exp2In" type="file" accept=".txt,.csv,text/plain"> exported File2 (East/North/Height)
+  </div>
+  <div class="row">
+    <button id="compareBtn">Compare original and exported File2</button>
+  </div>
+
+  <div class="row controls">
+  <a id="download1" class="btn disabled" aria-disabled="true">Download File1 (Hz/V/Distance)</a>
+  <a id="download2" class="btn disabled" aria-disabled="true">Download File2 (East/North/Height)</a>
+  </div>
+
+  <h3>Preview</h3>
+  <pre id="preview">Preview will appear here after parsing.</pre>
+
+<script>
+(function(){
+  // security / runtime limits
+  const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB - reasonable for .lqp on mobile
+  const fileIn = document.getElementById('fileIn');
+  const parseBtn = document.getElementById('parseBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const preview = document.getElementById('preview');
+  const dl1 = document.getElementById('download1');
+  const dl2 = document.getElementById('download2');
+  const origIn = document.getElementById('origIn');
+  const exp2In = document.getElementById('exp2In');
+  const compareBtn = document.getElementById('compareBtn');
+  let file1txt = '';
+  let file2txt = '';
+
+  function padRight(s, n){ s = String(s); return s + ' '.repeat(Math.max(0, n - s.length)); }
+  function padLeft(s, n){ s = String(s); return ' '.repeat(Math.max(0, n - s.length)) + s; }
+  function fmtNum(n, dec){ return Number(n).toFixed(dec); }
+
+  function parseText(text){
+    try{
+      if(typeof text!=='string') throw new Error('Input must be text');
+    }catch(e){ throw e; }
+    const lines = text.split(/\r?\n/);
+    // File1: Punkt-Nr, Hz, V, Distanz from measurement lines (Hz <= 360)
+    const map1 = new Map();
+
+  // match: ID Hz V Distanz [Ref.H]  (Ref.H is optional and follows the distance in the same line)
+  const measRegex = /^\s*(\S+)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)(?:\s+([0-9]+(?:\.[0-9]+)?))?\b/;
+    for(let i=0;i<lines.length;i++){
+      const line = lines[i];
+      const m = line.match(measRegex);
+      if(m){
+        const id = m[1];
+        const hz = parseFloat(m[2]);
+        const v = parseFloat(m[3]);
+  const dist = parseFloat(m[4]);
+  const prismH = (m[5] !== undefined) ? parseFloat(m[5]) : undefined;
+        if(!isNaN(hz) && hz <= 360){ // likely an angle (Hz)
+          // do not extract coordinate height here (will interfere). only keep prism height (Ref.H)
+          if(!map1.has(id)) map1.set(id, {id, hz, v, dist, prismHeight: prismH});
+        }
+      }
+    }
+
+    // File2: prefer Anschlusspunkte(Restklaffen/Soll-Koordinaten) blocks
+    const map2 = new Map();
+    // find indices of lines with "Anschlusspunkte" header
+    let startIdxs = [];
+    for(let i=0;i<lines.length;i++){
+      if(lines[i].toLowerCase().includes('anschlusspunkte')){
+        startIdxs.push(i);
+      }
+    }
+    // function to scan block after header
+    function scanBlock(from){
+      for(let i=from+1;i<Math.min(lines.length, from+400);i++){
+        const ln = lines[i];
+        // find lines that start with an ID (non-space token) followed by whitespace and small floats
+        const idLine = ln.match(/^\s*(\S+)\b.*$/);
+        if(idLine){
+          const idCandidate = idLine[1];
+          // skip if the token looks like a coordinate (contains a decimal point)
+          if(/\./.test(idCandidate)) continue;
+          // Ensure this line contains at least one decimal number (diffs) so it's the first line of an entry
+          if(/[0-9]+\.[0-9]+/.test(ln)){
+            // look ahead up to next 4 lines to find coordinate triplet
+            for(let j=i+1;j<=i+4 && j<lines.length;j++){
+              const coordLine = lines[j];
+              // case with 2D/3D prefix
+              let m = coordLine.match(/\b(?:2D|3D)\b[^0-9\-]*(\d{6,}\.\d+)\s+(\d{6,}\.\d+)\s+(-?[0-9]+\.?[0-9]*)/);
+              if(!m){
+                // or just three numbers with big Ost/Nord
+                m = coordLine.match(/(^|\s)(\d{6,}\.\d+)\s+(\d{6,}\.\d+)\s+(-?[0-9]+\.?[0-9]*)/);
+              }
+              if(m){
+                const ost = m[1] ? m[1] : m[2];
+                // careful: if the first capture is prefix, adjust
+                let ostVal, nordVal, hVal;
+                if(m.length===4){ // from 2D/3D regex -> groups 1 ost 2 nord 3 h
+                  ostVal = m[1]; nordVal = m[2]; hVal = m[3];
+                } else { // groups from second regex: group2 ost group3 nord group4 h
+                  ostVal = m[2]; nordVal = m[3]; hVal = m[4];
+                }
+                if(ostVal && nordVal){
+                  // ensure the idCandidate is not actually one of the coordinate strings
+                  if(idCandidate !== ostVal && idCandidate !== nordVal){
+                    if(!map2.has(idCandidate)) map2.set(idCandidate, {id:idCandidate, ost: parseFloat(ostVal), nord: parseFloat(nordVal), height: parseFloat(hVal)});
+                  }
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // scan each found header block
+    if(startIdxs.length===0){
+      // fallback: scan entire file for pattern (id line followed within 3 lines by big coords)
+      for(let i=0;i<lines.length;i++){
+        const idline = lines[i].match(/^\s*(\S+)\b.*$/);
+        if(idline && /[0-9]+\.[0-9]+/.test(lines[i])){
+          const idc = idline[1];
+          // skip if this token is actually a coordinate (has decimal point)
+          if(/\./.test(idc)) continue;
+          for(let j=i+1;j<=i+4 && j<lines.length;j++){
+            const coordLine = lines[j];
+            let m = coordLine.match(/(^|\s)(\d{6,}\.\d+)\s+(\d{6,}\.\d+)\s+(-?[0-9]+\.?[0-9]*)/);
+            if(m){ 
+              // ensure idc is not a coordinate string
+              if(idc !== m[2] && idc !== m[3]){
+                if(!map2.has(idc)) map2.set(idc, {id:idc, ost:parseFloat(m[2]), nord:parseFloat(m[3]), height:parseFloat(m[4])});
+              }
+              break; 
+            }
+          }
+        }
+      }
+    } else {
+      startIdxs.forEach(idx=>scanBlock(idx));
+    }
+
+    // Prepare outputs
+  // File1 header (English) - include Ref.H (prism height); written as a comment line
+  let out1 = '# for File 1 - Point-ID     Hz           V       Distance    Ref.H\r\n';
+  for(const [id,obj] of map1){
+      const refStr = (obj.prismHeight===undefined || obj.prismHeight===null) ? padLeft('',12) : padLeft(fmtNum(obj.prismHeight,3),12);
+      const line = '             ' + padRight(id,13) + padLeft(fmtNum(obj.hz,4),12) + padLeft(fmtNum(obj.v,4),13) + padLeft(fmtNum(obj.dist,3),12) + refStr;
+      out1 += line + '\r\n';
+    }
+
+    // File2 header (English); written as a comment line
+    let out2 = '# for File 2 - Point-ID       East          North        Height\r\n';
+    for(const [id,obj] of map2){
+      const line = '             ' + padRight(id,13) + ' ' + padLeft(fmtNum(obj.ost,3),15) + ' ' + padLeft(fmtNum(obj.nord,3),14) + ' ' + padLeft(fmtNum(obj.height,3),12);
+      out2 += line + '\r\n';
+    }
+
+    return {out1, out2, map1Count: map1.size, map2Count: map2.size};
+  }
+
+  function makeDownload(content, name){
+    const blob = new Blob([content], {type: 'text/plain;charset=utf-8'});
+    return {blob};
+  }
+
+  // download helper that creates a temporary anchor, triggers download, revokes URL
+  function downloadBlob(blob, filename){
+    try{
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.style.display = 'none';
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(()=>{
+        try{ URL.revokeObjectURL(url); }catch(e){}
+        a.remove();
+      }, 150);
+    }catch(e){ console.error('download failed', e); alert('Download failed: ' + (e && e.message ? e.message : e)); }
+  }
+
+  function parseOrig(text){
+    const lines = text.split(/\r?\n/);
+    const map = {};
+    const idre = /^\s*(\S+)\b.*$/;
+    const coordRe = /(?:\b2D\b|\b3D\b)?[^0-9\-]*(\d{6,}\.\d+)\s+(\d{7,}\.\d+)\s+(-?\d+\.?\d*)/;
+    for(let i=0;i<lines.length;i++){
+      const m = lines[i].match(idre);
+  if(!m) continue;
+  const id = m[1];
+  // require id to contain at least one digit (filters out header words like 'Status'/'Prisma-Typ')
+  if(!/\d/.test(id)) continue;
+  if(/\./.test(id) || /^(2D|3D|Round|Mini|None)$/i.test(id)) continue;
+      for(let j=i+1;j<=i+5 && j<lines.length;j++){
+        const c = lines[j].match(coordRe);
+        if(c){ map[id] = [c[1], c[2], c[3]]; break; }
+      }
+    }
+    return map;
+  }
+
+  function parseExportedFile2(text){
+    const map = {};
+    const lines = text.split(/\r?\n/);
+    const re = /^\s*(\S+)\s+(\d{6,}\.\d+)\s+(\d{7,}\.\d+)\s+(-?\d+\.?\d*)/;
+    for(const ln of lines){
+      const m = ln.match(re);
+      if(m){ const id=m[1]; if(!/^(2D|3D|Round|Mini|None)$/i.test(id) && !/^[0-9]+\.\d+$/.test(id)) map[id]=[m[2],m[3],m[4]]; }
+    }
+    return map;
+  }
+
+  function compareMaps(origMap, expMap){
+    const report = [];
+    const matches = [];
+    const mismatches = [];
+    const missing = [];
+    for(const id in expMap){
+      if(id in origMap){
+        const o = origMap[id].map(x=>String(Number(x)));
+        const e = expMap[id].map(x=>String(Number(x)));
+        if(o[0]===e[0] && o[1]===e[1] && o[2]===e[2]) matches.push(id);
+        else mismatches.push({id, orig:origMap[id], exp:expMap[id]});
+      } else {
+        missing.push({id, exp:expMap[id]});
+      }
+    }
+    report.push(`Total exported points: ${Object.keys(expMap).length}`);
+    report.push(`Matches: ${matches.length}`);
+    report.push(`Mismatches: ${mismatches.length}`);
+    report.push(`Not found in original: ${missing.length}`);
+    if(mismatches.length){ report.push('\nMismatches:'); mismatches.forEach(m=> report.push(`${m.id}: original=${m.orig.join(', ')} exported=${m.exp.join(', ')}`)); }
+    if(missing.length){ report.push('\nNot found in original:'); missing.forEach(m=> report.push(`${m.id}: exported=${m.exp.join(', ')}`)); }
+    return report.join('\n');
+  }
+
+  parseBtn.addEventListener('click', ()=>{
+    const f = fileIn.files && fileIn.files[0];
+    if(!f){ alert('Select a .lqp file'); return; }
+    if(f.size > MAX_FILE_SIZE){ alert('File too large for mobile processing (>' + (MAX_FILE_SIZE/1024/1024) + ' MB)'); return; }
+    const reader = new FileReader();
+    reader.onload = function(){
+      const text = reader.result;
+      try{
+        const res = parseText(text);
+        file1txt = res.out1;
+        file2txt = res.out2;
+        preview.textContent = 'File1: ' + res.map1Count + ' point(s)\nFile2: ' + res.map2Count + ' point(s)\n\n--- File1 preview ---\n' + file1txt + '\n--- File2 preview ---\n' + file2txt;
+
+        // enable download buttons: attach click handlers that create a temporary anchor per-click
+        const d1 = makeDownload(file1txt, 'file1.txt');
+        const d2 = makeDownload(file2txt, 'file2.txt');
+        // clear previous handlers
+        dl1.onclick = null; dl2.onclick = null;
+        dl1.classList.remove('disabled'); dl1.setAttribute('aria-disabled','false');
+        dl2.classList.remove('disabled'); dl2.setAttribute('aria-disabled','false');
+        dl1.onclick = function(e){ e.preventDefault(); downloadBlob(d1.blob, 'file1.txt'); };
+        dl2.onclick = function(e){ e.preventDefault(); downloadBlob(d2.blob, 'file2.txt'); };
+      }catch(e){
+        console.error('Parse error', e);
+        alert('Failed to parse file: ' + (e && e.message ? e.message : 'unknown'));
+        preview.textContent = 'Parse error: ' + (e && e.message ? e.message : String(e));
+      }
+    };
+    reader.readAsText(f, 'utf-8');
+  });
+
+  // clear UI
+  clearBtn.addEventListener('click', ()=>{
+    fileIn.value = '';
+    preview.textContent = 'Preview will appear here after parsing.';
+    file1txt = file2txt = '';
+  dl1.removeAttribute('href'); dl1.classList.add('disabled'); dl1.setAttribute('aria-disabled','true'); dl1.onclick = null;
+  dl2.removeAttribute('href'); dl2.classList.add('disabled'); dl2.setAttribute('aria-disabled','true'); dl2.onclick = null;
+  });
+
+  // drag & drop support for convenience on mobile (file picker still primary)
+  const dropArea = document.body;
+  dropArea.addEventListener('dragover', e=>{ e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
+  dropArea.addEventListener('drop', e=>{ e.preventDefault(); const f = e.dataTransfer.files && e.dataTransfer.files[0]; if(f){ fileIn.files = e.dataTransfer.files; parseBtn.click(); } });
+
+  compareBtn.addEventListener('click', ()=>{
+    const fo = origIn.files && origIn.files[0];
+    const fe2 = exp2In.files && exp2In.files[0];
+    if(!fo || !fe2){ alert('Select original .lqp and exported File2.txt'); return; }
+    const r1 = new FileReader();
+    const r2 = new FileReader();
+    r1.onload = function(){
+      const origMap = parseOrig(r1.result);
+      r2.onload = function(){
+        const expMap = parseExportedFile2(r2.result);
+        const out = compareMaps(origMap, expMap);
+        preview.textContent = out;
+      };
+      r2.readAsText(fe2, 'utf-8');
+    };
+    r1.readAsText(fo, 'utf-8');
+  });
+
+})();
+</script>
+</body>
+</html>
