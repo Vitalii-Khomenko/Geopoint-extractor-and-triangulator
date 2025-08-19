@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FixPoint Name Checker</title>
+  <style>
+    :root{--green:#28a745;--green-dark:#218838;--muted:#6b7280}
+    body{font-family:Segoe UI, Tahoma, Arial, sans-serif; padding:18px; color:#222; background:#fbfcfd}
+    .container{max-width:1100px; margin:0 auto}
+    h1{font-size:1.4rem; margin-bottom:6px}
+    .row{display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap}
+  .col{flex:1; min-width:260px}
+  /* colored parts for point fields */
+  .pt-name{color:#128a43; font-weight:700}
+  .pt-east{color:#d57a00}
+  .pt-north{color:#0b7285}
+  .pt-height{color:#c92a2a}
+  /* editor that supports colored parts */
+  .editor{width:100%; min-height:200px; box-sizing:border-box; padding:8px; font-size:0.64rem; background:white; border:1px solid #e6e9ee; border-radius:6px; overflow:auto}
+  .editor .line{display:block; padding:2px 0}
+    input[type=file]{width:100%}
+  table{border-collapse:collapse; width:100%; margin-top:12px; font-size:0.64rem}
+    th,td{border:1px solid #e6e9ee; padding:8px; text-align:left}
+    th{background:#f6f8fa; color:#111}
+    tr.mismatch{background:#fff4f4}
+    .controls{margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+    .small{font-size:0.9rem; color:var(--muted)}
+    button{padding:10px 14px; border-radius:8px; border:0; background:var(--green); color:white; box-shadow:0 2px 0 rgba(0,0,0,0.08); font-weight:600}
+    button.ghost{background:#f3f4f6; color:#111; box-shadow:none}
+    label{display:block; margin-bottom:6px; font-weight:600}
+    @media (max-width:700px){
+      body{padding:12px}
+      .row{flex-direction:column}
+      textarea{height:220px}
+      button{width:100%; padding:12px}
+    }
+  </style>
+</head>
+<body>
+  <h1>FixPoint Name Checker</h1>
+  <p class="small">Upload the <code>FixPoint.txt</code> file (correct names + coordinates) and the computed results file (for example <code>computed_coords.txt</code>). The tool will find points that match by coordinates and indicate where the names differ.</p>
+
+  <div class="container">
+  <div class="row">
+    <div class="col">
+      <label><strong>FixPoint (reference names)</strong></label>
+      <input id="fixfile" type="file" accept=".txt,.csv" />
+  <div class="small">Or paste the file contents into the editor below:</div>
+  <div id="fixtext" class="editor" contenteditable="true" aria-label="FixPoint editor" placeholder="Paste FixPoint.txt content here"></div>
+    </div>
+    <div class="col">
+      <label><strong>Computed (calculated results)</strong></label>
+      <input id="compfile" type="file" accept=".txt,.tsv,.csv" />
+  <div class="small">Or paste the file contents into the editor below:</div>
+  <div id="comptext" class="editor" contenteditable="true" aria-label="Computed editor" placeholder="Paste computed_coords.txt content here"></div>
+    </div>
+  </div>
+
+  <div class="controls">
+  <label>Comparison tolerance (meters, max 0.02 = 20 mm): <input id="tol" type="number" value="0.02" step="0.001" style="width:80px" /></label>
+  <span class="small" style="margin-left:10px">(Tolerance will be clamped to 0.02 m if larger value provided)</span>
+  <div class="small" style="margin-top:6px">Matching requires all three parameters: East, North and Height (height must be present in both files).</div>
+  <button id="process">Find matches</button>
+  <button id="showMismatches">Show only name mismatches</button>
+  <button id="exportTxt">Export TXT</button>
+  <button id="copyClipboard">Copy to clipboard</button>
+  </div>
+
+  <div id="resultCount" class="small" style="margin-top:10px"></div>
+  <div id="tableWrap"></div>
+
+  <script>
+  // Security and reliability constants
+  const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+  const MAX_LINES = 20000; // avoid OOM or huge processing
+  const MAX_MATCHES = 5000; // cap matches rendered/exported
+  const MAX_CHARS = 2 * 1000 * 1000; // 2M characters per editor
+
+    // Parsers
+    // Parse a single line into {name,east,north,height}
+    function parseLineToParts(line){
+      const toks = line.split(/\s+/).filter(t=>t!=='');
+      // collect numeric tokens with metadata
+      const numMeta = toks.map((t,i)=>{
+        const raw = t.replace(/,/g,'.');
+        const v = Number(raw);
+        return {i, raw, v, isNum: Number.isFinite(v), hasDot: raw.indexOf('.')>=0};
+      });
+
+      let eastIdx = -1, northIdx = -1, heightIdx = -1;
+
+      // Prefer numeric tokens that contain a decimal point for East/North
+      const decimalNums = numMeta.filter(n => n.isNum && n.hasDot);
+      if(decimalNums.length >= 1){
+        // first decimal numeric is likely East
+        eastIdx = decimalNums[0].i;
+        if(decimalNums.length >= 2) northIdx = decimalNums[1].i;
+        // height often is decimal but much smaller; try to find a decimal numeric after north or east with smaller magnitude
+        for(const n of numMeta){ if(n.isNum && n.i > (northIdx !== -1 ? northIdx : eastIdx) && Math.abs(n.v) < 10000){ heightIdx = n.i; break; } }
+      } else {
+        // fallback: use first numeric tokens (could include integer point IDs); prefer tokens after first token
+        const numeric = numMeta.filter(n => n.isNum);
+        if(numeric.length >= 1) eastIdx = numeric[0].i;
+        if(numeric.length >= 2) northIdx = numeric[1].i;
+        if(numeric.length >= 3) heightIdx = numeric[2].i;
+      }
+
+      // If the first token is an integer ID and the second token is a decimal, shift name to empty and accept second as east
+      if(eastIdx === 0 && toks.length > 1 && numMeta[0].isNum && !numMeta[0].hasDot && numMeta[1] && numMeta[1].hasDot){
+        // treat token 0 as ID, but keep it as name if non-empty string; name should be before eastIdx
+        // We'll treat name as tokens before eastIdx (which is 1)
+      }
+
+      const nameParts = [];
+      for(let i=0;i<toks.length;i++){
+        if(i===eastIdx || i===northIdx || i===heightIdx) continue;
+        if(eastIdx === -1 || i < eastIdx) nameParts.push(toks[i]);
+      }
+      const name = nameParts.join(' ').trim() || '';
+      const east = eastIdx !== -1 ? parseFloat(toks[eastIdx].replace(/,/g,'.')) : NaN;
+      const north = northIdx !== -1 ? parseFloat(toks[northIdx].replace(/,/g,'.')) : NaN;
+      const height = heightIdx !== -1 ? parseFloat(toks[heightIdx].replace(/,/g,'.')) : NaN;
+      return {name,east,north,height};
+    }
+    function parseFixPoint(text){
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l);
+      const points = [];
+      for(const line of lines){
+        // Skip header lines if present
+        if(/Point|East|North|Height/i.test(line) && line.includes('East')) continue;
+        const p = parseLineToParts(line);
+        if(Number.isFinite(p.east) && Number.isFinite(p.north)) points.push({name:p.name || String(p.name), east:p.east, north:p.north, height:Number.isFinite(p.height)?p.height:NaN});
+      }
+      return points;
+    }
+
+    function parseComputed(text){
+      // computed files are often TSV with header: Point-ID\tEast\tNorth\tHeight
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l);
+      const points = [];
+      // try detect header
+      let start = 0;
+      if(lines.length===0) return points;
+      if(/Point|Point-ID|East/i.test(lines[0])) start = 1;
+      for(let i=start;i<lines.length;i++){
+        const line = lines[i];
+        const p = parseLineToParts(line);
+        if(Number.isFinite(p.east) && Number.isFinite(p.north)) points.push({name:p.name || String(p.name), east:p.east, north:p.north, height:Number.isFinite(p.height)?p.height:NaN});
+      }
+      return points;
+    }
+
+    function loadFileInput(fileInput, textarea){
+      const file = fileInput.files && fileInput.files[0];
+      if(!file) return;
+      if(file.size && file.size > MAX_FILE_SIZE){ alert('File too large (max 5 MB)'); return; }
+      const reader = new FileReader();
+  reader.onload = e => {
+    try{
+      const txt = cleanTextLines(String(e.target.result || ''));
+      textarea.innerText = txt;
+      renderEditorWithColors(textarea);
+    }catch(err){ console.error(err); alert('Failed to load file'); }
+  };
+      reader.readAsText(file);
+    }
+
+      document.getElementById('fixfile').addEventListener('change', ()=> loadFileInput(document.getElementById('fixfile'), document.getElementById('fixtext')));
+    document.getElementById('compfile').addEventListener('change', ()=> loadFileInput(document.getElementById('compfile'), document.getElementById('comptext')));
+
+  function nearlyEqual(a,b,tol){ return Math.abs(a-b) <= Math.abs(tol); }
+
+    function coordKey(e,n,h,tol){
+      // bucket by rounding to tolerance for E,N,H
+      // if height is missing, use a special bucket marker
+      const rx = Number.isFinite(e) && Number.isFinite(tol) ? Math.round(e / tol) : 'ne';
+      const ry = Number.isFinite(n) && Number.isFinite(tol) ? Math.round(n / tol) : 'nn';
+      const rz = Number.isFinite(h) && Number.isFinite(tol) ? Math.round(h / tol) : 'nh';
+      return rx + '|' + ry + '|' + rz;
+    }
+
+    function renderTable(matches){
+      const wrap = document.getElementById('tableWrap');
+      wrap.innerHTML = '';
+      document.getElementById('resultCount').textContent = `Matches found by coordinates: ${matches.length}`;
+      if(matches.length===0) return;
+      const tbl = document.createElement('table');
+      const thead = document.createElement('thead');
+  thead.innerHTML = `<tr><th>#</th><th>Fix name</th><th>Fix E</th><th>Fix N</th><th>Fix H</th><th>Computed name</th><th>Comp E</th><th>Comp N</th><th>Comp H</th><th>Name matches?</th></tr>`;
+      tbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      matches.forEach((m,i)=>{
+        const tr = document.createElement('tr');
+        if(!m.nameMatch) tr.classList.add('mismatch');
+        tr.innerHTML = `<td>${i+1}</td>
+          <td><span class="pt-name">${escapeHtml(m.fix.name)}</span></td>
+          <td><span class="pt-east">${formatNumber(m.fix.east)}</span></td>
+          <td><span class="pt-north">${formatNumber(m.fix.north)}</span></td>
+          <td><span class="pt-height">${formatNumber(m.fix.height)}</span></td>
+          <td><span class="pt-name">${escapeHtml(m.comp.name)}</span></td>
+          <td><span class="pt-east">${formatNumber(m.comp.east)}</span></td>
+          <td><span class="pt-north">${formatNumber(m.comp.north)}</span></td>
+          <td><span class="pt-height">${formatNumber(m.comp.height)}</span></td>
+          <td>${m.nameMatch? 'Yes':'No'}</td>`;
+        tbody.appendChild(tr);
+      });
+      tbl.appendChild(tbody);
+      wrap.appendChild(tbl);
+      // store matches for export
+      window.__matches = matches;
+    }
+
+    // Render colored content into editor element. Does not modify underlying text values.
+    function renderEditorWithColors(editorEl){
+      const raw = editorEl.innerText || '';
+      const lines = raw.split(/\r?\n/).map(l=>l.trim()).filter(l=>l);
+      const html = lines.map(line=>{
+        const p = parseLineToParts(line);
+        if(!Number.isFinite(p.east) || !Number.isFinite(p.north)) return `<span class="line">${escapeHtml(line)}</span>`;
+        return `<span class="line"><span class="pt-name">${escapeHtml(p.name)}</span> <span class="pt-east">${formatNumber(p.east)}</span> <span class="pt-north">${formatNumber(p.north)}</span> <span class="pt-height">${Number.isFinite(p.height)?formatNumber(p.height):''}</span></span>`;
+      }).join('');
+      editorEl.innerHTML = html;
+    }
+
+    // Small helpers
+    function escapeHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function formatNumber(v){ return Number.isFinite(v) ? Number(v).toFixed(3) : ''; }
+
+    function cleanTextLines(text){
+      let t = String(text || '');
+      if(t.length > MAX_CHARS){ console.warn('Input truncated to MAX_CHARS'); t = t.slice(0, MAX_CHARS); }
+      const lines = t.split(/\r?\n/).map(l=>l.replace(/\t+/g,' ').trim());
+      if(lines.length > MAX_LINES){ console.warn('Line count exceeds MAX_LINES, truncating'); lines.length = MAX_LINES; }
+      return lines.join('\n');
+    }
+
+    // wire buttons and editor events
+    document.getElementById('process').addEventListener('click', process);
+    document.getElementById('showMismatches').addEventListener('click', ()=>{
+      const matches = window.__matches || [];
+      if(matches.length===0){ alert('No matches available. Run Find matches first.'); return; }
+      const mism = matches.filter(m => !m.nameMatch);
+      renderTable(mism);
+    });
+
+    // re-render colored preview when editor content changes (paste/type)
+    document.getElementById('fixtext').addEventListener('input', (e)=> renderEditorWithColors(e.currentTarget));
+    document.getElementById('comptext').addEventListener('input', (e)=> renderEditorWithColors(e.currentTarget));
+
+    function process(){
+      try{
+        const fixText = document.getElementById('fixtext').innerText.trim();
+        const compText = document.getElementById('comptext').innerText.trim();
+        if(!fixText || !compText){ alert('Please provide both files (FixPoint and computed).'); return; }
+        let tol = parseFloat(document.getElementById('tol').value) || 0.02;
+        const maxTol = 0.02; // 20 mm
+        if(tol > maxTol){
+          alert('Tolerance exceeds maximum 0.02 m (20 mm). It will be clamped to 0.02 m.');
+          tol = maxTol;
+          document.getElementById('tol').value = String(maxTol);
+        }
+        const fixPts = parseFixPoint(fixText);
+        const compPts = parseComputed(compText);
+
+        // create spatial index by rounding coordinates (E,N,H) to tolerance to speed up
+        const idx = new Map();
+        for(const c of compPts){
+          const key = coordKey(c.east, c.north, c.height, tol);
+          if(!idx.has(key)) idx.set(key, []);
+          idx.get(key).push(c);
+        }
+
+        const matches = [];
+        for(const f of fixPts){
+          const key = coordKey(f.east, f.north, f.height, tol);
+          const candidates = idx.get(key) || [];
+          for(const c of candidates){
+            // verify with strict numeric tolerance on all three parameters
+            const haveH = Number.isFinite(f.height) && Number.isFinite(c.height);
+            if(nearlyEqual(f.east, c.east, tol) && nearlyEqual(f.north, c.north, tol) && haveH && nearlyEqual(f.height, c.height, tol)){
+              matches.push({fix:f, comp:c, nameMatch: String(f.name).trim()===String(c.name).trim()});
+            }
+          }
+        }
+
+        // cap matches for safety
+        if(matches.length > MAX_MATCHES){
+          console.warn('Matches exceed limit, truncating to ' + MAX_MATCHES);
+        }
+        renderTable(matches.slice(0, MAX_MATCHES));
+      }catch(err){
+        console.error(err);
+        alert('An unexpected error occurred during processing. See console for details.');
+      }
+    }
+    document.getElementById('exportTxt').addEventListener('click', ()=>{
+      const matches = window.__matches || [];
+      if(matches.length===0){ alert('No matches to export'); return; }
+      const header = ['Fix name','Fix E','Fix N','Fix H','Computed name','Comp E','Comp N','Comp H','NameMatch'].join('\t');
+      const lines = [header];
+      for(const m of matches){
+        const r = [
+          String(m.fix && m.fix.name || ''),
+          String(Number(m.fix && m.fix.east).toFixed(3) || ''),
+          String(Number(m.fix && m.fix.north).toFixed(3) || ''),
+          (Number.isFinite(m.fix && m.fix.height) ? String(Number(m.fix.height).toFixed(3)) : ''),
+          String(m.comp && m.comp.name || ''),
+          String(Number(m.comp && m.comp.east).toFixed(3) || ''),
+          String(Number(m.comp && m.comp.north).toFixed(3) || ''),
+          (Number.isFinite(m.comp && m.comp.height) ? String(Number(m.comp.height).toFixed(3)) : ''),
+          m.nameMatch ? 'Yes' : 'No'
+        ];
+        lines.push(r.join('\t'));
+      }
+      const txt = lines.join('\r\n');
+      const blob = new Blob([txt], {type:'text/plain;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'fixpoint_matches.txt';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    });
+
+    document.getElementById('copyClipboard').addEventListener('click', async ()=>{
+      const matches = window.__matches || [];
+  if(matches.length===0){ alert('No matches to copy'); return; }
+      const header = ['Fix name','Fix E','Fix N','Fix H','Computed name','Comp E','Comp N','Comp H','NameMatch'].join('\t');
+      const lines = [header];
+      for(const m of matches){
+        const r = [
+          String(m.fix && m.fix.name || ''),
+          formatNumber(m.fix && m.fix.east),
+          formatNumber(m.fix && m.fix.north),
+          Number.isFinite(m.fix && m.fix.height) ? formatNumber(m.fix.height) : '',
+          String(m.comp && m.comp.name || ''),
+          formatNumber(m.comp && m.comp.east),
+          formatNumber(m.comp && m.comp.north),
+          Number.isFinite(m.comp && m.comp.height) ? formatNumber(m.comp.height) : '',
+          m.nameMatch ? 'Yes' : 'No'
+        ];
+        lines.push(r.join('\t'));
+      }
+      const text = lines.join('\r\n');
+      try{
+        await navigator.clipboard.writeText(text);
+        alert('Copied to clipboard');
+      }catch(e){
+        // fallback
+        const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); alert('Copied (fallback)');
+      }
+    });
+
+    
+
+    // helper: quick-load sample from repo files? We can't access disk from browser; user will upload files or paste.
+  </script>
+</body>
+</html>

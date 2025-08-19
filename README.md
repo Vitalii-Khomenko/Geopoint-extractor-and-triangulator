@@ -123,3 +123,14 @@ Notes:
 
 ## Contact / next steps
 If you want any of the improvements above (toggle for `Ref.H` sign, streaming parse, bias/scale parameters or unit tests), tell me which one and I will implement it next.
+
+## FixPoint Name Checker (new)
+Added a small client-side tool `fixpoint_name_checker.html` that compares a reference FixPoint file (correct point names and coordinates) with computed results (for example `computed_coords.txt`). It finds points that match by coordinates (East, North and Height) within a configurable tolerance and highlights where the names differ. The tool runs entirely in the browser and exports tab-separated TXT with coordinates formatted to 3 decimal places.
+
+Safety & limits implemented in the tool:
+- Maximum file size: 5 MB
+- Maximum lines processed per editor: 20,000
+- Maximum characters per editor: 2,000,000
+- Maximum matches returned/exported: 5,000
+
+These limits prevent excessive memory/CPU usage in the browser. If you need larger files, run the tool on desktop browsers with sufficient memory or split files beforehand.
