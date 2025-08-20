@@ -7,6 +7,7 @@ Combined documentation for the Geopoint Extractor and Geopoint Triangulator — 
 - Programs
   - Geopoint Extractor
   - Geopoint Triangulator
+  - FixPoint Name Checker
 - File formats
 - Quick usage
 - Mobile & security notes
