@@ -58,13 +58,14 @@
   </div>
 
   <div class="controls">
-  <label>Comparison tolerance (meters, max 0.02 = 20 mm): <input id="tol" type="number" value="0.02" step="0.001" style="width:80px" /></label>
-  <span class="small" style="margin-left:10px">(Tolerance will be clamped to 0.02 m if larger value provided)</span>
+  <label>Comparison tolerance (meters, max 0.075 = 75 mm): <input id="tol" type="number" value="0.02" step="0.001" style="width:80px" /></label>
+  <span class="small" style="margin-left:10px">(Tolerance will be clamped to 0.075 m if larger value provided; you can test down to 0.01 m = 10 mm)</span>
   <div class="small" style="margin-top:6px">Matching requires all three parameters: East, North and Height (height must be present in both files).</div>
   <button id="process">Find matches</button>
   <button id="showMismatches">Show only name mismatches</button>
   <button id="exportTxt">Export TXT</button>
   <button id="copyClipboard">Copy to clipboard</button>
+  <button id="tolTest" class="ghost">Tolerance self-test</button>
   </div>
 
   <div id="resultCount" class="small" style="margin-top:10px"></div>
@@ -169,7 +170,40 @@
       document.getElementById('fixfile').addEventListener('change', ()=> loadFileInput(document.getElementById('fixfile'), document.getElementById('fixtext')));
     document.getElementById('compfile').addEventListener('change', ()=> loadFileInput(document.getElementById('compfile'), document.getElementById('comptext')));
 
-  function nearlyEqual(a,b,tol){ return Math.abs(a-b) <= Math.abs(tol); }
+    // numeric compare with tiny epsilon to avoid floating point rounding issues
+    function nearlyEqual(a,b,tol){ const EPS = 1e-9; return Math.abs(a-b) <= (Math.abs(tol) + EPS); }
+
+    // collect candidates from neighboring buckets to avoid misses when coordinates fall on bucket edges
+    function collectNeighborCandidates(idx, e, n, h, tol){
+      if(!Number.isFinite(e) || !Number.isFinite(n)) return [];
+      const rx = Math.round(e / tol);
+      const ry = Math.round(n / tol);
+      const rz = Number.isFinite(h) ? Math.round(h / tol) : null;
+      const seen = new Set();
+      const out = [];
+      const dRange = [-1,0,1];
+      for(const dx of dRange){
+        for(const dy of dRange){
+          for(const dz of (rz===null? [null] : dRange)){
+            const kx = (Number.isFinite(e) ? String(rx + dx) : 'ne');
+            const ky = (Number.isFinite(n) ? String(ry + dy) : 'nn');
+            const kz = (rz===null ? 'nh' : String(rz + dz));
+            const key = kx + '|' + ky + '|' + kz;
+            const arr = idx.get(key);
+            if(arr && arr.length){
+              for(const it of arr){
+                const id = (it && it.name) ? (it.name + '|' + String(it.east) + '|' + String(it.north) + '|' + String(it.height)) : JSON.stringify(it);
+                if(!seen.has(id)){
+                  seen.add(id);
+                  out.push(it);
+                }
+              }
+            }
+          }
+        }
+      }
+      return out;
+    }
 
     function coordKey(e,n,h,tol){
       // bucket by rounding to tolerance for E,N,H
@@ -247,6 +281,32 @@
     // re-render colored preview when editor content changes (paste/type)
     document.getElementById('fixtext').addEventListener('input', (e)=> renderEditorWithColors(e.currentTarget));
     document.getElementById('comptext').addEventListener('input', (e)=> renderEditorWithColors(e.currentTarget));
+    document.getElementById('tolTest').addEventListener('click', runToleranceTests);
+
+    // Run quick self-tests to verify matching behavior at small tolerances
+    function runToleranceTests(){
+      // create a base point and offsets in meters
+      const base = {name:'TEST', east: 1000000.123, north: 2000000.456, height: 50.123};
+      const offsets = [0.0005, 0.001, 0.005, 0.01, 0.02, 0.05, 0.075]; // in meters
+      const offsets_mm = offsets.map(o=>Math.round(o*1000));
+      const report = [];
+      for(const tol of offsets){
+        const tol_mm = Math.round(tol*1000);
+        // for each test, create a candidate with small delta just below/above tol
+        const below = {name:'C', east: base.east + (tol*0.9), north: base.north + (tol*0.9), height: base.height + (tol*0.9)};
+        const above = {name:'C', east: base.east + (tol*1.1), north: base.north + (tol*1.1), height: base.height + (tol*1.1)};
+        // build index with below
+        const idx = new Map();
+        const key = coordKey(below.east, below.north, below.height, tol);
+        idx.set(key, [below]);
+        const candBelow = collectNeighborCandidates(idx, base.east, base.north, base.height, tol);
+        const candAbove = collectNeighborCandidates(idx, base.east, base.north, base.height, tol*1.0);
+        const matchesBelow = candBelow.some(c => nearlyEqual(c.east, base.east, tol) && nearlyEqual(c.north, base.north, tol) && nearlyEqual(c.height, base.height, tol));
+        const matchesAbove = candAbove.some(c => nearlyEqual(c.east, base.east, tol) && nearlyEqual(c.north, base.north, tol) && nearlyEqual(c.height, base.height, tol));
+        report.push(`${tol_mm} mm -> below:${matchesBelow? 'Y':'N'} above:${matchesAbove? 'Y':'N'}`);
+      }
+      document.getElementById('resultCount').textContent = 'Tolerance test: ' + report.join(' | ');
+    }
 
     function process(){
       try{
@@ -254,9 +314,9 @@
         const compText = document.getElementById('comptext').innerText.trim();
         if(!fixText || !compText){ alert('Please provide both files (FixPoint and computed).'); return; }
         let tol = parseFloat(document.getElementById('tol').value) || 0.02;
-        const maxTol = 0.02; // 20 mm
+        const maxTol = 0.075; // 75 mm
         if(tol > maxTol){
-          alert('Tolerance exceeds maximum 0.02 m (20 mm). It will be clamped to 0.02 m.');
+          alert('Tolerance exceeds maximum 0.075 m (75 mm). It will be clamped to 0.075 m.');
           tol = maxTol;
           document.getElementById('tol').value = String(maxTol);
         }
@@ -274,7 +334,8 @@
         const matches = [];
         for(const f of fixPts){
           const key = coordKey(f.east, f.north, f.height, tol);
-          const candidates = idx.get(key) || [];
+          // fetch nearby candidates from neighboring buckets to avoid edge misses
+          const candidates = collectNeighborCandidates(idx, f.east, f.north, f.height, tol) || [];
           for(const c of candidates){
             // verify with strict numeric tolerance on all three parameters
             const haveH = Number.isFinite(f.height) && Number.isFinite(c.height);

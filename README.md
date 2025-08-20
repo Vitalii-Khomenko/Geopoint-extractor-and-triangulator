@@ -133,4 +133,6 @@ Safety & limits implemented in the tool:
 - Maximum characters per editor: 2,000,000
 - Maximum matches returned/exported: 5,000
 
+Note: comparison tolerance default is 0.02 m (20 mm) and can be increased up to 0.075 m (75 mm) via the UI.
+
 These limits prevent excessive memory/CPU usage in the browser. If you need larger files, run the tool on desktop browsers with sufficient memory or split files beforehand.
